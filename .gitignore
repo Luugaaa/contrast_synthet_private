@@ -1,0 +1,11 @@
+*.pyc
+*.png
+*.jpg
+*.heic
+*.jpeg
+.DS_Store
+*.json
+data/
+*.log
+wandb/
+*.pth
