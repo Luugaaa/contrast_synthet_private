@@ -22,6 +22,8 @@ import io
 import tqdm
 import time
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
+
 def plot_histograms_to_image(input_hist, target_hist, gen_hist, num_bins):
     """
     Generates an image of overlapping histograms using matplotlib.
@@ -566,7 +568,7 @@ def main():
     BIDS_ROOT_PATH = "datasets/processed_BIDS_full/sub-01/"
     PROCESSED_DATA_DIR = "datasets/processed_png_raw/"
     MODEL_SAVE_PATH = "mri_contrast_generator.pth"
-    BATCH_SIZE = 1
+    BATCH_SIZE = 24
     DARK_PIXEL_THRESHOLD = 0.15
     
     NUM_EPOCHS = 300
@@ -689,7 +691,6 @@ def main():
             t0 = time.time()
             input_images = input_images.to(device)
             # ref_images = ref_images.to(device)
-
             input_blurred = blur_conv(input_images)
             t1 = time.time()
             #print('blur thing : ', t1-t0)
@@ -752,21 +753,21 @@ def main():
             #print('Hist loss : ', t7-t6)
             # L_histogram = hierarchical_hist_loss_fn(generated_output, target_hists)
             
-            threshold = -0.85
-            mask = input_images > threshold
+            # threshold = -0.85
+            # mask = input_images > threshold
 
-            masked_gen_output = torch.masked_select(generated_output, mask)
-            masked_input_images = torch.masked_select(input_images, mask)
+            # masked_gen_output = torch.masked_select(generated_output, mask)
+            # masked_input_images = torch.masked_select(input_images, mask)
 
-            # 3. Calculate the L1 loss on the selected pixels
-            # Add a check to prevent errors if no pixels are selected
-            if masked_input_images.nelement() > 0:
-                L_im_sim_input = similarity_loss_fn(masked_gen_output, masked_input_images)
-            else:
-                # If no pixels are above the threshold, the loss is zero for this component
-                L_im_sim_input = torch.tensor(0.0, device=generated_output.device)
+            # # 3. Calculate the L1 loss on the selected pixels
+            # # Add a check to prevent errors if no pixels are selected
+            # if masked_input_images.nelement() > 0:
+            #     L_im_sim_input = similarity_loss_fn(masked_gen_output, masked_input_images)
+            # else:
+            #     # If no pixels are above the threshold, the loss is zero for this component
+            #     L_im_sim_input = torch.tensor(0.0, device=generated_output.device)
                 
-            L_im_disim_input = 1.0 -  L_im_sim_input
+            # L_im_disim_input = 1.0 -  L_im_sim_input
             t8 = time.time()
             #print('Dissim loss :', t8-t7)
             
@@ -832,7 +833,7 @@ def main():
                     })
                     
                     NB_IMAGE_LOGGED = min(BATCH_SIZE, 6)
-                    if epoch%5==0 or epoch == 1 or epoch == NUM_EPOCHS-1: 
+                    if epoch%15==0 or epoch == 1 or epoch == NUM_EPOCHS-1: 
                         resizer = transforms.Resize((393, 458))
                         
                         histogram_images = []
