@@ -13,7 +13,7 @@ import math
 import nibabel as nib
 
 from unet import UNet
-from prototype_5_mri_model import MRI_Synthesis_Net
+from prototype_7_mri_model import MRI_Synthesis_Net
 from torchsummary import summary
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -704,7 +704,7 @@ def main():
     LEARNING_RATE = 0.0003
     BIDS_ROOT_PATH = "datasets/processed_BIDS_full/sub-01/"
     PROCESSED_DATA_DIR = "datasets/processed_png_raw/"
-    MODEL_SAVE_PATH = "mri_contrast_generator_prototype_5.pth"
+    MODEL_SAVE_PATH = "mri_contrast_generator_prototype_7.pth"
     BATCH_SIZE = 24
     DARK_PIXEL_THRESHOLD = 0.15
     
@@ -729,9 +729,9 @@ def main():
     print(f"Using device: {device}")
 
     wandb.init(
-        project="mri-synthesis-prototype-5",
+        project="mri-synthesis-prototype-7",
         config={
-            "Prototype": "5", "learning_rate": LEARNING_RATE, "batch_size": BATCH_SIZE, "epochs": NUM_EPOCHS
+            "Prototype": "7", "learning_rate": LEARNING_RATE, "batch_size": BATCH_SIZE, "epochs": NUM_EPOCHS
         }
     )
 
@@ -878,7 +878,7 @@ def main():
             #     generated_output, residual = generator(-input_images, target_hist_scale_0)  
             # else :   
             #     generated_output, residual = generator(input_images, target_hist_scale_0)  
-            generated_output, residual = generator(input_images, target_hist_scale_0)  
+            generated_output, residual = generator(input_images, target_hist_scale_0, input_guidance_map)  
             t3 = time.time()
             #print('Generator forward :', t3-t2)   
             # blurred_gen = blur_conv(generated_output) 
@@ -927,9 +927,9 @@ def main():
             gen_guidance_map = generated_output
             
             # L_guidance = lpips_loss_fn(gen_guidance_map, input_guidance_map).mean()
-            gen_guidance_map = downsampler(gen_guidance_map)
-            guidance_downsampled = downsampler(input_guidance_map)
-            L_guidance = l1_loss_fn(gen_guidance_map, guidance_downsampled)
+            # gen_downsampled = downsampler(generated_output)
+            # guidance_downsampled = downsampler(input_guidance_map)
+            L_guidance = l1_loss_fn(gen_guidance_map, input_guidance_map)
 
             
             used_losses = {
@@ -1028,7 +1028,7 @@ def main():
                         with torch.no_grad():
                             img_grid = make_grid(
                                 # torch.cat((input_images[NB_IMAGE_LOGGED], edges_input[NB_IMAGE_LOGGED], edges_generated[NB_IMAGE_LOGGED], residual[NB_IMAGE_LOGGED], generated_output[NB_IMAGE_LOGGED])),
-                                torch.cat((input_images[:NB_IMAGE_LOGGED], guidance_downsampled[:NB_IMAGE_LOGGED], gen_guidance_map[:NB_IMAGE_LOGGED], edges_input[:NB_IMAGE_LOGGED], edges_generated[:NB_IMAGE_LOGGED], torch.clamp(residual[:NB_IMAGE_LOGGED], -1, 1), generated_output[:NB_IMAGE_LOGGED])),
+                                torch.cat((input_images[:NB_IMAGE_LOGGED], input_guidance_map[:NB_IMAGE_LOGGED], gen_guidance_map[:NB_IMAGE_LOGGED], edges_input[:NB_IMAGE_LOGGED], edges_generated[:NB_IMAGE_LOGGED], torch.clamp(residual[:NB_IMAGE_LOGGED], -1, 1), generated_output[:NB_IMAGE_LOGGED])),
                                 nrow=NB_IMAGE_LOGGED, normalize=True
                             )
                             wandb.log({"images": wandb.Image(img_grid, caption=f"Epoch {epoch+1}: Input | Reference | Residual | Output")})

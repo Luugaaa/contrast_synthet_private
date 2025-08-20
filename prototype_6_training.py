@@ -13,7 +13,7 @@ import math
 import nibabel as nib
 
 from unet import UNet
-from prototype_5_mri_model import MRI_Synthesis_Net
+from prototype_6_mri_model import MRI_Synthesis_Net
 from torchsummary import summary
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -21,22 +21,18 @@ import matplotlib.pyplot as plt
 import io
 import tqdm
 import time
-import lpips
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
 
-def plot_histograms_to_image(input_hist, target_hist, gen_hist, num_bins, dark_threshold=0.15):
+def plot_histograms_to_image(input_hist, target_hist, gen_hist, num_bins):
     """
-    Generates an image of overlapping histograms with dynamic y-axis scaling
-    to make details in low-count bins visible.
+    Generates an image of overlapping histograms using matplotlib.
 
     Args:
         input_hist (torch.Tensor): Histogram data for the input image.
         target_hist (torch.Tensor): Histogram data for the target distribution.
         gen_hist (torch.Tensor): Histogram data for the generated image.
         num_bins (int): The number of bins in the histograms.
-        dark_threshold (float): The normalized intensity threshold below which
-                                pixels are considered part of the 'dark peak'.
 
     Returns:
         PIL.Image: An image of the plot.
@@ -47,52 +43,41 @@ def plot_histograms_to_image(input_hist, target_hist, gen_hist, num_bins, dark_t
     gen_hist = gen_hist.cpu().numpy()
 
     # Normalize histograms to represent probability distributions for better comparison
-    input_hist_p = input_hist / (input_hist.sum() + 1e-8)
-    target_hist_p = target_hist / (target_hist.sum() + 1e-8)
-    gen_hist_p = gen_hist / (gen_hist.sum() + 1e-8)
+    input_hist = input_hist / (input_hist.sum() + 1e-8)
+    target_hist = target_hist / (target_hist.sum() + 1e-8)
+    gen_hist = gen_hist / (gen_hist.sum() + 1e-8)
 
-    # --- Dynamic Y-axis Scaling ---
-    # 1. Define the boundary between the 'dark peak' and the 'hills'
-    dark_bin_limit = int(dark_threshold * num_bins)
-
-    # 2. Find the max value within the 'hills' region across all three histograms
-    all_hists = np.stack([input_hist_p, target_hist_p, gen_hist_p])
-    max_of_hills = all_hists[:, dark_bin_limit:].max() if dark_bin_limit < num_bins else all_hists.max()
-
-    # 3. Find the max value within the 'dark peak' region
-    peak_of_dark_pixels = all_hists[:, :dark_bin_limit].max() if dark_bin_limit > 0 else max_of_hills
-
-    # 4. Calculate the new y-axis limit based on your logic
-    new_y_limit = min(2 * max_of_hills, peak_of_dark_pixels)
-    new_y_limit *= 1.1  # Add a small buffer for better visualization
-    
     # Define bin centers for the x-axis
     bin_centers = np.linspace(0.0, 1.0, num_bins)
 
     # Create plot
-    plt.ioff()
-    fig, ax = plt.subplots(figsize=(5, 4))
+    plt.ioff() # Turn off interactive mode
+    fig, ax = plt.subplots(figsize=(5, 4)) # Create a figure and axes
 
-    # Plot each histogram
-    ax.plot(bin_centers, input_hist_p, label='Input', color='blue', alpha=0.7)
-    ax.plot(bin_centers, target_hist_p, label='Target', color='red', alpha=0.7, linestyle='--')
-    ax.plot(bin_centers, gen_hist_p, label='Generated', color='green', alpha=0.7)
-
-    # Style the plot and apply the dynamic y-axis limit
-    ax.set_title('Histogram Comparison (Scaled Y-axis)')
+    # Plot each histogram as a line with some transparency
+    ax.plot(bin_centers, input_hist, label='Input', color='blue', alpha=0.7)
+    ax.plot(bin_centers, target_hist, label='Target', color='red', alpha=0.7, linestyle='--')
+    ax.plot(bin_centers, gen_hist, label='Generated', color='green', alpha=0.7)
+    
+    # Style the plot
+    ax.set_title('Histogram Comparison')
     ax.set_xlabel('Pixel Intensity (Normalized)')
     ax.set_ylabel('Probability')
     ax.legend()
     ax.grid(True, linestyle='--', alpha=0.6)
-    ax.set_ylim(bottom=0, top=new_y_limit if new_y_limit > 0 else None)
+    ax.set_ylim(bottom=0)
 
     # Save plot to an in-memory buffer
     buf = io.BytesIO()
     fig.savefig(buf, format='png', bbox_inches='tight')
     buf.seek(0)
+    
+    # Create a PIL Image from the buffer
     img = Image.open(buf)
+    
+    # Clean up
     plt.close(fig)
-
+    
     return img
 
 class PreprocessedMriDataset(Dataset):
@@ -265,97 +250,25 @@ class DifferentiableHistogram(nn.Module):
         return hist
 
 
-# class DifferentiableWassersteinLoss(nn.Module):
-#     def __init__(self):
-#         super(DifferentiableWassersteinLoss, self).__init__()
-#         self.l1_loss_fn = nn.L1Loss()
-
-#     def forward(self, gen_hist_batch, target_hist_batch):
-#         # Normalize both histograms to get probability distributions
-#         gen_hist_p = gen_hist_batch / (gen_hist_batch.sum(dim=1, keepdim=True) + 1e-8)
-#         target_hist_p = target_hist_batch / (target_hist_batch.sum(dim=1, keepdim=True) + 1e-8)
-
-#         # Calculate the Cumulative Distribution Functions (CDFs)
-#         gen_cdf = torch.cumsum(gen_hist_p, dim=1)
-#         target_cdf = torch.cumsum(target_hist_p, dim=1)
-        
-#         l1_loss = self.l1_loss_fn(gen_hist_p, target_hist_p)
-
-#         # The 1D Wasserstein distance is the L1 distance between the CDFs
-#         return torch.mean(torch.abs(gen_cdf - target_cdf)) + l1_loss
-    
 class DifferentiableWassersteinLoss(nn.Module):
-    """
-    Calculates a modified Wasserstein distance, which is the L1 distance
-    between the Cumulative Distribution Functions (CDFs) of two histograms,
-    plus an L1 loss between their Probability Density Functions (PDFs).
-
-    This implementation computes this loss for both the entire histogram and
-    selectively for the 'bright' region (pixels above a dark threshold),
-    returning the sum of both as the total loss.
-    """
     def __init__(self):
         super(DifferentiableWassersteinLoss, self).__init__()
         self.l1_loss_fn = nn.L1Loss()
 
-    def _calculate_loss(self, gen_hist, target_hist):
-        """Helper function to calculate loss for a given histogram pair."""
-        # Normalize histograms to get probability distributions (PDFs)
-        gen_hist_p = gen_hist / (gen_hist.sum(dim=1, keepdim=True) + 1e-8)
-        target_hist_p = target_hist / (target_hist.sum(dim=1, keepdim=True) + 1e-8)
+    def forward(self, gen_hist_batch, target_hist_batch):
+        # Normalize both histograms to get probability distributions
+        gen_hist_p = gen_hist_batch / (gen_hist_batch.sum(dim=1, keepdim=True) + 1e-8)
+        target_hist_p = target_hist_batch / (target_hist_batch.sum(dim=1, keepdim=True) + 1e-8)
 
         # Calculate the Cumulative Distribution Functions (CDFs)
         gen_cdf = torch.cumsum(gen_hist_p, dim=1)
         target_cdf = torch.cumsum(target_hist_p, dim=1)
         
-        # Calculate L1 loss on the PDFs
-        l1_loss = self.l1_loss_fn(gen_hist_p, target_hist_p)*200.0
+        l1_loss = self.l1_loss_fn(gen_hist_p, target_hist_p)
 
         # The 1D Wasserstein distance is the L1 distance between the CDFs
-        wasserstein_dist = torch.mean(torch.abs(gen_cdf - target_cdf))
-        
-        return wasserstein_dist + l1_loss, l1_loss
+        return torch.mean(torch.abs(gen_cdf - target_cdf)) + l1_loss
 
-    def forward(self, gen_hist_batch, target_hist_batch, num_bins, dark_threshold):
-        """
-        Computes the total Wasserstein loss by summing the loss from the full
-        histogram and the loss from the histogram's 'bright' region.
-
-        Args:
-            gen_hist_batch (torch.Tensor): The batch of generated histograms.
-            target_hist_batch (torch.Tensor): The batch of target histograms.
-            num_bins (int): The total number of bins in the histograms.
-            dark_threshold (float): The normalized intensity threshold (0-1) to
-                                    separate dark and bright regions.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
-                - total_loss (the sum of the two component losses)
-                - loss_full (loss on the entire histogram)
-                - loss_bright (loss on the histogram region > dark_threshold)
-        """
-        # --- 1. Loss for the whole histogram ---
-        loss_full, loss_l1_full = self._calculate_loss(gen_hist_batch, target_hist_batch)
-
-        # --- 2. Loss for the "bright" part of the histogram ---
-        # Determine the split point
-        dark_bin_limit = int(num_bins * dark_threshold)
-
-        # Slice the histograms to get the bright part
-        gen_hist_bright = gen_hist_batch[:, dark_bin_limit:]
-        target_hist_bright = target_hist_batch[:, dark_bin_limit:]
-        
-        # Calculate loss only if there are bins in the bright region
-        if gen_hist_bright.shape[1] > 0:
-            loss_bright, loss_l1_bright = self._calculate_loss(gen_hist_bright, target_hist_bright)
-        else:
-            # If there are no bins, the loss component is zero
-            loss_bright, loss_l1_bright = torch.tensor(0.0, device=gen_hist_batch.device), torch.tensor(0.0, device=gen_hist_batch.device)
-
-        # --- 3. Combine losses and return ---
-        total_loss = loss_full + loss_bright
-        
-        return total_loss, loss_full, loss_bright, loss_l1_full, loss_l1_bright
 
 # ==========================================================
 # RANGE LOSS
@@ -514,7 +427,6 @@ class DiceEdgeLoss(nn.Module):
         dice = (2 * intersection) / union
 
         return 1.0 - dice.mean() + l1_loss, pred_edges, target_edges
-        # return 1.0 - dice.mean(), pred_edges, target_edges
  
 class TotalVariationLoss(nn.Module):
     """
@@ -585,140 +497,127 @@ def generate_unified_targets_with_means(input_images, num_bins, num_chunks, dark
     # Return the means directly instead of the full map
     return target_hist, target_chunk_means
 
-
-def generate_unified_targets(input_images, num_bins, num_chunks, dark_threshold):
+def create_target_guidance_map(input_image, target_chunk_means, num_chunks, dark_threshold):
     """
-    Generates a synchronized target histogram, target mean values for each chunk,
-    and the permutation map used for shuffling.
-
-    Args:
-        input_images (torch.Tensor): The input images batch.
-        num_bins (int): Total number of bins for the histogram.
-        num_chunks (int): Number of chunks to split the foreground histogram into.
-        dark_threshold (float): Intensity threshold for defining the background.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
-            - target_hist (The shuffled target histogram)
-            - target_chunk_means (The target mean for each chunk after shuffling)
-            - perms (The permutation tensor mapping original chunk indices to new ones)
-    """
-    B, _, H, W = input_images.shape
-    device = input_images.device
-    chunk_size = num_bins // num_chunks
-    assert num_bins % num_chunks == 0, "num_bins must be divisible by num_chunks"
-
-    images_denorm = input_images * 0.5 + 0.5
-    background_mask = (images_denorm < dark_threshold)
-    
-    # Calculate separate histograms for the fixed background and the shufflable foreground
-    hist_fixed = calculate_batch_histograms(input_images, num_bins, mask=background_mask)
-    hist_shufflable = calculate_batch_histograms(input_images, num_bins, mask=~background_mask)
-
-    # Reshape the shufflable part into chunks
-    original_shufflable_chunks = hist_shufflable.view(B, num_chunks, chunk_size)
-    
-    # Generate a random permutation for each item in the batch
-    perms = torch.rand(B, num_chunks, device=device).argsort(dim=1)
-    
-    # Apply the permutation to the chunks
-    perms_expanded = perms.unsqueeze(-1).expand(-1, -1, chunk_size)
-    shuffled_part_chunks = torch.gather(original_shufflable_chunks, dim=1, index=perms_expanded)
-    
-    # Reconstruct the full target histogram
-    shuffled_part = shuffled_part_chunks.view(B, num_bins)
-    target_hist = hist_fixed + shuffled_part
-
-    # --- Calculate Target Means (for the old loss, but can still be useful for logging) ---
-    bin_values = torch.linspace(-1.0, 1.0, num_bins, device=device)
-    bin_values_chunked = bin_values.view(1, num_chunks, chunk_size)
-    
-    original_chunk_means = (original_shufflable_chunks * bin_values_chunked).sum(dim=2) / (original_shufflable_chunks.sum(dim=2) + 1e-6)
-    target_chunk_means = torch.gather(original_chunk_means, dim=1, index=perms)
-    
-    # Return the permutations along with the other targets
-    return target_hist, target_chunk_means, perms
-
-
-def create_range_translation_guidance_map(input_image, perms, num_chunks, dark_threshold):
-    """
-    Generates a guidance map by performing a range-to-range intensity translation.
-    Each pixel's new value is determined by its relative position within its
-    original intensity chunk, translated to the new target chunk defined by the permutation.
-
-    Args:
-        input_image (torch.Tensor): The original input images batch [B, 1, H, W].
-        perms (torch.Tensor): The permutation tensor from `generate_unified_targets` [B, num_chunks].
-        num_chunks (int): The number of intensity regions (quantiles).
-        dark_threshold (float): Threshold below which pixels are considered background.
-
-    Returns:
-        torch.Tensor: The generated guidance map with translated intensity ranges [B, 1, H, W].
+    Creates the target guidance map based on the input image and target mean values for different intensity regions.
+    This logic is extracted from the RegionWiseGuidanceLoss for use before the generator call.
     """
     B, _, H, W = input_image.shape
     device = input_image.device
 
-    # 1. Denormalize image and identify background
     images_denorm = input_image * 0.5 + 0.5
-    background_mask = (images_denorm < dark_threshold)
+    background_mask = (images_denorm < dark_threshold) # Shape: [B, 1, H, W]
 
-    # 2. Isolate and re-normalize foreground pixels to a [0, 1] range
-    # This makes it easy to calculate chunk indices and relative positions
-    fg_pixels_01 = (images_denorm - dark_threshold) / (1.0 - dark_threshold)
-    fg_pixels_01 = torch.clamp(fg_pixels_01, 0.0, 1.0) # Clamp for safety
+    # Create bounds for all chunks at once.
+    lower_bounds = torch.arange(0, num_chunks, device=device) / num_chunks
+    upper_bounds = (torch.arange(1, num_chunks + 1, device=device)) / num_chunks
 
-    # 3. Determine the original chunk index and relative position within that chunk
-    original_chunk_idx = (fg_pixels_01 * num_chunks).long()
-    original_chunk_idx = torch.clamp(original_chunk_idx, 0, num_chunks - 1)
+    # Reshape bounds for broadcasting with images.
+    lb_reshaped = lower_bounds.view(1, num_chunks, 1, 1)
+    ub_reshaped = upper_bounds.view(1, num_chunks, 1, 1)
 
-    chunk_width = 1.0 / num_chunks
-    chunk_lower_bound = original_chunk_idx.float() * chunk_width
-    relative_pos = (fg_pixels_01 - chunk_lower_bound) / chunk_width
+    # Create a stack of all quantile masks.
+    all_masks = (images_denorm >= lb_reshaped) & (images_denorm < ub_reshaped)
+    all_final_masks = all_masks & ~background_mask
 
-    # 4. Find the target chunk index using the permutation map
-    # We use advanced indexing to look up the new chunk index for each pixel
-    batch_indices = torch.arange(B, device=device).view(B, 1, 1)
-    target_chunk_idx = perms[batch_indices, original_chunk_idx.squeeze(1)].unsqueeze(1)
+    # Reshape target means for broadcasting.
+    target_means_reshaped = target_chunk_means.view(B, num_chunks, 1, 1)
 
-    # 5. Calculate the new pixel value by translating the relative position to the new chunk
-    target_chunk_lower_bound = target_chunk_idx.float() * chunk_width
-    new_fg_value_01 = target_chunk_lower_bound + relative_pos * chunk_width
+    # Build the blocky guidance map.
+    guidance_map_fg = (all_final_masks.float() * target_means_reshaped).sum(dim=1, keepdim=True)
+    target_guidance_map = torch.where(background_mask, -1.0, guidance_map_fg)
 
-    # 6. De-normalize the new foreground value back to the [dark_threshold, 1.0] range
-    new_fg_value_denorm = new_fg_value_01 * (1.0 - dark_threshold) + dark_threshold
+    return target_guidance_map
 
-    # 7. Construct the final map: keep background pixels unchanged, use new foreground values
-    final_map_01 = torch.where(background_mask, images_denorm, new_fg_value_denorm)
+class RegionWiseGuidanceLoss(nn.Module):
+    """
+    Compares the average intensity of the generated output within predefined regions
+    to the target mean intensity for those regions. This version is fully batched.
+    """
+    def __init__(self, num_chunks, dark_threshold):
+        super(RegionWiseGuidanceLoss, self).__init__()
+        self.num_chunks = num_chunks
+        self.dark_threshold = dark_threshold
+        self.l1_loss = nn.L1Loss()
 
-    # 8. Normalize the final map back to the model's [-1, 1] output range
-    guidance_map = final_map_01 * 2.0 - 1.0
-    
-    return guidance_map
+    def forward(self, generated_output, input_image, target_chunk_means):
+        B, _, H, W = input_image.shape
+        device = input_image.device
 
+        images_denorm = input_image * 0.5 + 0.5
+        background_mask = (images_denorm < self.dark_threshold) # Shape: [B, 1, H, W]
 
+        # --- 1. Create a stack of all quantile masks ---
+        # Create bounds for all chunks at once. Shape: [num_chunks]
+        lower_bounds = torch.arange(0, self.num_chunks, device=device) / self.num_chunks
+        upper_bounds = (torch.arange(1, self.num_chunks + 1, device=device)) / self.num_chunks
+
+        # Reshape bounds for broadcasting with images. Shape: [1, num_chunks, 1, 1]
+        lb_reshaped = lower_bounds.view(1, self.num_chunks, 1, 1)
+        ub_reshaped = upper_bounds.view(1, self.num_chunks, 1, 1)
+        
+        # Compare image with all bounds. Resultant shape: [B, num_chunks, H, W]
+        all_masks = (images_denorm >= lb_reshaped) & (images_denorm < ub_reshaped)
+        
+        # Exclude background from masks. Shape is preserved: [B, num_chunks, H, W]
+        all_final_masks = all_masks & ~background_mask
+
+        # --- 2. Calculate means for all regions at once ---
+        # `generated_output` is [B, 1, H, W]. `all_final_masks` is [B, num_chunks, H, W].
+        # Broadcasting works, resulting in shape: [B, num_chunks, H, W]
+        masked_outputs = generated_output * all_final_masks.float()
+
+        # Sum over spatial dimensions (H, W). Result shape: [B, num_chunks]
+        sums_of_pixels = masked_outputs.sum(dim=[2, 3])
+        nums_pixels_in_masks = all_final_masks.float().sum(dim=[2, 3])
+
+        # Calculate means. Result shape is correctly [B, num_chunks]
+        all_generated_means = sums_of_pixels / (nums_pixels_in_masks + 1e-6)
+
+        # --- 3. Loss Calculation ---
+        # Now we are correctly comparing two tensors of shape [B, num_chunks]
+        loss = self.l1_loss(all_generated_means, target_chunk_means)
+        
+        # --- 4. Visualization Map Generation (also corrected) ---
+        # Reshape means for broadcasting. Shape: [B, num_chunks, 1, 1]
+        target_means_reshaped = target_chunk_means.view(B, self.num_chunks, 1, 1)
+        generated_means_reshaped = all_generated_means.view(B, self.num_chunks, 1, 1)
+
+        # Build the blocky maps
+        input_guidance_map_fg = (all_final_masks.float() * target_means_reshaped).sum(dim=1, keepdim=True)
+        input_guidance_map = torch.where(background_mask, -1.0, input_guidance_map_fg)
+
+        generated_guidance_map_fg = (all_final_masks.float() * generated_means_reshaped).sum(dim=1, keepdim=True)
+        generated_guidance_map = torch.where(background_mask, -1.0, generated_guidance_map_fg)
+
+        return loss, input_guidance_map, generated_guidance_map
     
 def main():
     # ==========================================================
     # 3. HYPERPARAMETERS & SETUP
     # ==========================================================
-    LEARNING_RATE = 0.0003
+    LEARNING_RATE = 0.001
     BIDS_ROOT_PATH = "datasets/processed_BIDS_full/sub-01/"
     PROCESSED_DATA_DIR = "datasets/processed_png_raw/"
-    MODEL_SAVE_PATH = "mri_contrast_generator_prototype_5.pth"
+    MODEL_SAVE_PATH = "mri_contrast_generator_prototype_6.pth"
     BATCH_SIZE = 24
     DARK_PIXEL_THRESHOLD = 0.15
     
-    NUM_EPOCHS = 500
+    NUM_EPOCHS = 300
     NUMBER_OF_BINS = 288
     HISTOGRAM_CHUNKS = 8
     
-    LAMBDA_EDGE_OUTPUT = 5.0
-    LAMBDA_HISTOGRAM = 6.0
-    LAMBDA_RANGE = 10000.0 
+    LAMBDA_FEAT = 1.0
+    LAMBDA_EDGE_OUTPUT = 3.0
+    LAMBDA_HISTOGRAM = 3.0
+    LAMBDA_RANGE = 500.0 
     LAMBDA_TV = 1.5
     LAMBDA_DISIM = 0.9
-    LAMBDA_GUIDANCE = 60.0
+    LAMBDA_GUIDANCE = 15.0
 
+    LAMBDA_HISTOGRAM_HIERARCHICAL = 10.0
+    HIST_MAX_SCALE = 1
+    HIST_SCALE_WEIGHTS = [1.0, 1.5]
         
     DATA_DIR = "data_prototype_3"
     FEATURE_EXTRACTOR_PATH = "unet_prototype_3.pth"
@@ -729,16 +628,17 @@ def main():
     print(f"Using device: {device}")
 
     wandb.init(
-        project="mri-synthesis-prototype-5",
+        project="mri-synthesis-prototype-6",
         config={
-            "Prototype": "5", "learning_rate": LEARNING_RATE, "batch_size": BATCH_SIZE, "epochs": NUM_EPOCHS
+            "learning_rate": LEARNING_RATE, "batch_size": BATCH_SIZE, "epochs": NUM_EPOCHS,
+            "lambda_feat": LAMBDA_FEAT, "loss_type": "CosineSimilarity"
         }
     )
 
     # ==========================================================
     # 4. LOAD MODELS
     # ==========================================================
-    generator = MRI_Synthesis_Net(scale_factor=1, num_hist_bins=NUMBER_OF_BINS).to(device)
+    generator = MRI_Synthesis_Net(scale_factor=1).to(device)
 
     generator.to(device)
     generator.train()
@@ -792,14 +692,10 @@ def main():
     
     tv_loss_fn = TotalVariationLoss().to(device)
     
-    l1_loss_fn = nn.L1Loss()
-    
-    TARGET_SIZE = 32
-    downsampler = nn.AdaptiveAvgPool2d((TARGET_SIZE, TARGET_SIZE))
-    downsampler.to(device)     
-    
-    # lpips_loss_fn = lpips.LPIPS(net='vgg').to(device)
-
+    guidance_loss_fn = RegionWiseGuidanceLoss(
+            num_chunks=HISTOGRAM_CHUNKS,
+            dark_threshold=DARK_PIXEL_THRESHOLD
+        ).to(device)
     
     # hierarchical_hist_loss_fn = HierarchicalHistogramLoss(
     #     max_scale=HIST_MAX_SCALE,
@@ -807,6 +703,7 @@ def main():
     #     num_bins=NUMBER_OF_BINS
     # ).to(device)
     
+    similarity_loss_fn = nn.L1Loss()
     
     scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=0.00001)
     differentiable_hist = DifferentiableHistogram(num_bins=NUMBER_OF_BINS, min_val=-1.0, max_val=1.0).to(device)
@@ -839,27 +736,19 @@ def main():
             #     dark_threshold=0.15
             # )
             
-            # target_hist_scale_0, target_means = generate_unified_targets_with_means(
-            #     input_images,
-            #     num_bins=NUMBER_OF_BINS,
-            #     num_chunks=HISTOGRAM_CHUNKS,
-            #     dark_threshold=DARK_PIXEL_THRESHOLD
-            # )
-            
-            target_hist_scale_0, target_means, perms = generate_unified_targets(
+            target_hist_scale_0, target_means = generate_unified_targets_with_means(
                 input_images,
                 num_bins=NUMBER_OF_BINS,
                 num_chunks=HISTOGRAM_CHUNKS,
                 dark_threshold=DARK_PIXEL_THRESHOLD
             )
             
-            input_guidance_map = create_range_translation_guidance_map(
-                input_images, 
-                perms, 
-                num_chunks=HISTOGRAM_CHUNKS, 
+            target_guidance_map = create_target_guidance_map(
+                input_images,
+                target_means,
+                num_chunks=HISTOGRAM_CHUNKS,
                 dark_threshold=DARK_PIXEL_THRESHOLD
             )
-            
             
             t2 = time.time()
             #print('Gen shuffle hist : ', t2-t1)
@@ -878,7 +767,7 @@ def main():
             #     generated_output, residual = generator(-input_images, target_hist_scale_0)  
             # else :   
             #     generated_output, residual = generator(input_images, target_hist_scale_0)  
-            generated_output, residual = generator(input_images, target_hist_scale_0)  
+            generated_output, residual = generator(input_images, target_guidance_map)  
             t3 = time.time()
             #print('Generator forward :', t3-t2)   
             # blurred_gen = blur_conv(generated_output) 
@@ -898,7 +787,7 @@ def main():
             t6  = time.time()
             #print('Range loss :', t6-t5)
             # L_histogram = histogram_loss_fn(generated_output, target_hist)
-            L_histogram, L_histogram_full, L_histogram_bright, L_hist_l1_full, L_hist_l1_bright = histogram_loss_fn(gen_hist, target_hist_scale_0, NUMBER_OF_BINS, DARK_PIXEL_THRESHOLD)
+            L_histogram = histogram_loss_fn(gen_hist, target_hist_scale_0)
             t7 = time.time()
             #print('Hist loss : ', t7-t6)
             # L_histogram = hierarchical_hist_loss_fn(generated_output, target_hists)
@@ -923,15 +812,8 @@ def main():
             
             L_tv = tv_loss_fn(residual)
             
-            # L_guidance, input_guidance_map, gen_guidance_map = guidance_loss_fn(generated_output, input_images, target_means)
-            gen_guidance_map = generated_output
-            
-            # L_guidance = lpips_loss_fn(gen_guidance_map, input_guidance_map).mean()
-            gen_guidance_map = downsampler(gen_guidance_map)
-            guidance_downsampled = downsampler(input_guidance_map)
-            L_guidance = l1_loss_fn(gen_guidance_map, guidance_downsampled)
-
-            
+            L_guidance, input_guidance_map, gen_guidance_map = guidance_loss_fn(generated_output, input_images, target_means)
+                        
             used_losses = {
                         "L_edge_preservation_output": [L_edge_preservation_output, LAMBDA_EDGE_OUTPUT],
                         "L_histogram": [L_histogram, LAMBDA_HISTOGRAM],
@@ -985,11 +867,6 @@ def main():
                         "main_losses/total_loss": total_loss.item(),
                         "main_losses/L_edge_preservation_output" : L_edge_preservation_output.item(),
                         "metric_losses/L_histogram" : L_histogram.item(),
-                        "histogram_losses/L_histogram" : L_histogram.item(),
-                        "histogram_losses/L_histogram_full" : L_histogram_full.item(),
-                        "histogram_losses/L_histogram_bright" : L_histogram_bright.item(),
-                        "histogram_losses/L_hist_l1_full": L_hist_l1_full.item(),
-                        "histogram_losses/L_hist_l1_bright": L_hist_l1_bright.item(),
                         # "histogram/comparison_plot": histogram_plot,
                         **weighted_losses_log,
                     })
@@ -1011,8 +888,7 @@ def main():
                                 input_hist=input_hist_data,
                                 target_hist=target_hist_data,
                                 gen_hist=gen_hist_data,
-                                num_bins=NUMBER_OF_BINS,
-                                dark_threshold=DARK_PIXEL_THRESHOLD # Pass the hyperparameter
+                                num_bins=NUMBER_OF_BINS
                             )
                             
                             # 3. Convert PIL Image to Tensor and add to list
@@ -1028,7 +904,7 @@ def main():
                         with torch.no_grad():
                             img_grid = make_grid(
                                 # torch.cat((input_images[NB_IMAGE_LOGGED], edges_input[NB_IMAGE_LOGGED], edges_generated[NB_IMAGE_LOGGED], residual[NB_IMAGE_LOGGED], generated_output[NB_IMAGE_LOGGED])),
-                                torch.cat((input_images[:NB_IMAGE_LOGGED], guidance_downsampled[:NB_IMAGE_LOGGED], gen_guidance_map[:NB_IMAGE_LOGGED], edges_input[:NB_IMAGE_LOGGED], edges_generated[:NB_IMAGE_LOGGED], torch.clamp(residual[:NB_IMAGE_LOGGED], -1, 1), generated_output[:NB_IMAGE_LOGGED])),
+                                torch.cat((input_images[:NB_IMAGE_LOGGED], target_guidance_map[:NB_IMAGE_LOGGED], input_guidance_map[:NB_IMAGE_LOGGED], gen_guidance_map[:NB_IMAGE_LOGGED], edges_input[:NB_IMAGE_LOGGED], edges_generated[:NB_IMAGE_LOGGED], residual[:NB_IMAGE_LOGGED], generated_output[:NB_IMAGE_LOGGED])),
                                 nrow=NB_IMAGE_LOGGED, normalize=True
                             )
                             wandb.log({"images": wandb.Image(img_grid, caption=f"Epoch {epoch+1}: Input | Reference | Residual | Output")})
