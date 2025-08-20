@@ -506,14 +506,14 @@ class DiceEdgeLoss(nn.Module):
         pred_edges = self.get_edge_mask(pred_img)
         target_edges = self.get_edge_mask(target_img)
         
-        l1_loss = self.l1_loss_fn(pred_edges, target_edges)
+        l1_loss = self.l1_loss_fn(pred_edges, target_edges)*2.5
 
         # Dice loss: 1 - Dice coefficient
         intersection = (pred_edges * target_edges).sum(dim=(1, 2, 3))
         union = pred_edges.sum(dim=(1, 2, 3)) + target_edges.sum(dim=(1, 2, 3)) + 1e-6
         dice = (2 * intersection) / union
 
-        return 1.0 - dice.mean() + l1_loss, pred_edges, target_edges
+        return 1.0 - dice.mean() + l1_loss, pred_edges, target_edges, l1_loss, 1.0 - dice.mean()
         # return 1.0 - dice.mean(), pred_edges, target_edges
  
 class TotalVariationLoss(nn.Module):
@@ -708,14 +708,14 @@ def main():
     BATCH_SIZE = 24
     DARK_PIXEL_THRESHOLD = 0.15
     
-    NUM_EPOCHS = 500
+    NUM_EPOCHS = 700
     NUMBER_OF_BINS = 288
     HISTOGRAM_CHUNKS = 8
     
     LAMBDA_EDGE_OUTPUT = 5.0
     LAMBDA_HISTOGRAM = 6.0
     LAMBDA_RANGE = 10000.0 
-    LAMBDA_TV = 1.5
+    LAMBDA_TV = 15
     LAMBDA_DISIM = 0.9
     LAMBDA_GUIDANCE = 60.0
 
@@ -826,7 +826,7 @@ def main():
             t0 = time.time()
             input_images = input_images.to(device)
             # ref_images = ref_images.to(device)
-            input_blurred = blur_conv(input_images)
+            # input_blurred = blur_conv(input_images)
             t1 = time.time()
             #print('blur thing : ', t1-t0)
 
@@ -887,9 +887,11 @@ def main():
             # gen_hist = differentiable_hist(generated_output)
             t4 = time.time()
             #print('Produce gen hist : ', t4-t3)
-            gen_hist = differentiable_hist(torch.tanh(residual*2+input_blurred))
+            # gen_hist = differentiable_hist(torch.tanh(residual*2+input_blurred))
+            # gen_hist = differentiable_hist(torch.tanh(residual*2+input_blurred))
+            gen_hist = differentiable_hist(generated_output)
             
-            L_edge_preservation_output, edges_generated, edges_input = edge_loss_fn(generated_output, input_images)
+            L_edge_preservation_output, edges_generated, edges_input, l1_edge_loss, dice_edge_loss = edge_loss_fn(generated_output, input_images)
             L_edge_preservation_output += edge_loss_fn(residual, input_images)[0]
             t5 = time.time()
             #print('Edge loss : ', t5-t4)
@@ -924,12 +926,13 @@ def main():
             L_tv = tv_loss_fn(residual)
             
             # L_guidance, input_guidance_map, gen_guidance_map = guidance_loss_fn(generated_output, input_images, target_means)
-            gen_guidance_map = generated_output
+            blurred_gen_guidance_map = blur_conv(generated_output)
+            blurred_input_guidance_map = blur_conv(input_guidance_map)
             
             # L_guidance = lpips_loss_fn(gen_guidance_map, input_guidance_map).mean()
             # gen_downsampled = downsampler(generated_output)
             # guidance_downsampled = downsampler(input_guidance_map)
-            L_guidance = l1_loss_fn(gen_guidance_map, input_guidance_map)
+            L_guidance = l1_loss_fn(blurred_gen_guidance_map, blurred_input_guidance_map)
 
             
             used_losses = {
@@ -990,6 +993,8 @@ def main():
                         "histogram_losses/L_histogram_bright" : L_histogram_bright.item(),
                         "histogram_losses/L_hist_l1_full": L_hist_l1_full.item(),
                         "histogram_losses/L_hist_l1_bright": L_hist_l1_bright.item(),
+                        "edge_losses/L_egde_l1": l1_edge_loss.item(),
+                        "edge_losses/L_egde_dice": dice_edge_loss.item(),
                         # "histogram/comparison_plot": histogram_plot,
                         **weighted_losses_log,
                     })
@@ -1028,7 +1033,7 @@ def main():
                         with torch.no_grad():
                             img_grid = make_grid(
                                 # torch.cat((input_images[NB_IMAGE_LOGGED], edges_input[NB_IMAGE_LOGGED], edges_generated[NB_IMAGE_LOGGED], residual[NB_IMAGE_LOGGED], generated_output[NB_IMAGE_LOGGED])),
-                                torch.cat((input_images[:NB_IMAGE_LOGGED], input_guidance_map[:NB_IMAGE_LOGGED], gen_guidance_map[:NB_IMAGE_LOGGED], edges_input[:NB_IMAGE_LOGGED], edges_generated[:NB_IMAGE_LOGGED], torch.clamp(residual[:NB_IMAGE_LOGGED], -1, 1), generated_output[:NB_IMAGE_LOGGED])),
+                                torch.cat((input_images[:NB_IMAGE_LOGGED], generated_output[:NB_IMAGE_LOGGED], input_guidance_map[:NB_IMAGE_LOGGED], blurred_input_guidance_map[:NB_IMAGE_LOGGED], blurred_gen_guidance_map[:NB_IMAGE_LOGGED], edges_input[:NB_IMAGE_LOGGED], edges_generated[:NB_IMAGE_LOGGED], torch.clamp(residual[:NB_IMAGE_LOGGED], -1, 1))),
                                 nrow=NB_IMAGE_LOGGED, normalize=True
                             )
                             wandb.log({"images": wandb.Image(img_grid, caption=f"Epoch {epoch+1}: Input | Reference | Residual | Output")})
