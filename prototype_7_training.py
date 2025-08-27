@@ -23,7 +23,7 @@ import tqdm
 import time
 import lpips
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1" 
 
 def plot_histograms_to_image(input_hist, target_hist, gen_hist, num_bins, dark_threshold=0.15):
     """
@@ -506,7 +506,7 @@ class DiceEdgeLoss(nn.Module):
         pred_edges = self.get_edge_mask(pred_img)
         target_edges = self.get_edge_mask(target_img)
         
-        l1_loss = self.l1_loss_fn(pred_edges, target_edges)*2.5
+        l1_loss = self.l1_loss_fn(pred_edges, target_edges)*3.5
 
         # Dice loss: 1 - Dice coefficient
         intersection = (pred_edges * target_edges).sum(dim=(1, 2, 3))
@@ -712,10 +712,10 @@ def main():
     NUMBER_OF_BINS = 288
     HISTOGRAM_CHUNKS = 8
     
-    LAMBDA_EDGE_OUTPUT = 5.0
+    LAMBDA_EDGE_OUTPUT = 40.0
     LAMBDA_HISTOGRAM = 6.0
     LAMBDA_RANGE = 10000.0 
-    LAMBDA_TV = 15
+    LAMBDA_TV = 5.0
     LAMBDA_DISIM = 0.9
     LAMBDA_GUIDANCE = 60.0
 
@@ -952,7 +952,9 @@ def main():
                 loss, weight = used_losses[l][0], used_losses[l][1]
                 total_loss += loss * weight
                 weighted_losses_log[f"weighted_losses/{l}"] = loss.item() * weight
-                
+            
+            # weighted_losses_log[f"weighted_losses/L_tv"] = L_tv.item() * LAMBDA_TV
+             
             optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
