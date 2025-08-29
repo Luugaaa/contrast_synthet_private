@@ -23,7 +23,7 @@ import tqdm
 import time
 import lpips
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1" 
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1" 
 
 def plot_histograms_to_image(input_hist, target_hist, gen_hist, num_bins, dark_threshold=0.15):
     """
@@ -462,7 +462,7 @@ class DiceEdgeLoss(nn.Module):
     The edge masks are obtained via Sobel gradients and softly binarized to preserve gradient flow.
     """
 
-    def __init__(self, device, threshold=0.6, alpha=2.0, blur_kernel_size=5, blur_sigma=2.0):
+    def __init__(self, device, threshold=0.2, alpha=1.0, blur_kernel_size=5, blur_sigma=2.0):
         super(DiceEdgeLoss, self).__init__()
         self.device = device
         self.threshold = threshold
@@ -506,7 +506,7 @@ class DiceEdgeLoss(nn.Module):
         pred_edges = self.get_edge_mask(pred_img)
         target_edges = self.get_edge_mask(target_img)
         
-        l1_loss = self.l1_loss_fn(pred_edges, target_edges)*3.5
+        l1_loss = self.l1_loss_fn(pred_edges, target_edges)*1.5
 
         # Dice loss: 1 - Dice coefficient
         intersection = (pred_edges * target_edges).sum(dim=(1, 2, 3))
@@ -696,26 +696,49 @@ def create_range_translation_guidance_map(input_image, perms, num_chunks, dark_t
     return guidance_map
 
 
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+def setup_ddp():
+    """A known-good DDP setup function."""
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
     
+    # THE ONLY CHANGE IS HERE: "nccl" -> "gloo"
+    dist.init_process_group(backend="gloo")
+    
+    print(f"[Rank {local_rank}] Setup complete with GLOO backend. Process is on device: {torch.cuda.current_device()}")
+
+    
+    return local_rank
+
+def cleanup_ddp():
+    """Destroys the distributed process group."""
+    dist.destroy_process_group()
+    
+      
 def main():
+    rank = setup_ddp()
+    
     # ==========================================================
     # 3. HYPERPARAMETERS & SETUP
     # ==========================================================
     LEARNING_RATE = 0.0003
     BIDS_ROOT_PATH = "datasets/processed_BIDS_full/sub-01/"
-    PROCESSED_DATA_DIR = "datasets/processed_png_raw/"
+    PROCESSED_DATA_DIR = "datasets/formatted_mri_data/train" #"datasets/processed_png_raw/"
     MODEL_SAVE_PATH = "mri_contrast_generator_prototype_7.pth"
-    BATCH_SIZE = 24
+    BATCH_SIZE = 10
     DARK_PIXEL_THRESHOLD = 0.15
     
-    NUM_EPOCHS = 700
+    NUM_EPOCHS = 300
     NUMBER_OF_BINS = 288
     HISTOGRAM_CHUNKS = 8
     
     LAMBDA_EDGE_OUTPUT = 40.0
     LAMBDA_HISTOGRAM = 6.0
     LAMBDA_RANGE = 10000.0 
-    LAMBDA_TV = 5.0
+    LAMBDA_TV = 6.0
     LAMBDA_DISIM = 0.9
     LAMBDA_GUIDANCE = 60.0
 
@@ -723,24 +746,32 @@ def main():
     DATA_DIR = "data_prototype_3"
     FEATURE_EXTRACTOR_PATH = "unet_prototype_3.pth"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = rank 
+    
+    print(f"[Rank {rank}] Initial setup complete. Creating dataset...")
+    dist.barrier()
+    
+    
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     print(f"Using device: {device}")
 
-    wandb.init(
-        project="mri-synthesis-prototype-7",
-        config={
-            "Prototype": "7", "learning_rate": LEARNING_RATE, "batch_size": BATCH_SIZE, "epochs": NUM_EPOCHS
-        }
-    )
+    if rank == 0:
+        wandb.init(
+            project="mri-synthesis-prototype-7",
+            config={
+                "Prototype": "7", "learning_rate": LEARNING_RATE, "batch_size": BATCH_SIZE, "epochs": NUM_EPOCHS
+            }
+        )
 
     # ==========================================================
     # 4. LOAD MODELS
     # ==========================================================
-    generator = MRI_Synthesis_Net(scale_factor=1, num_hist_bins=NUMBER_OF_BINS).to(device)
+    model = MRI_Synthesis_Net(scale_factor=1, num_hist_bins=NUMBER_OF_BINS).to(device)
 
-    generator.to(device)
+    model.to(device)
+    generator = DDP(model, device_ids=[device])
     generator.train()
 
     # Load the UNet trained on the complex data
@@ -764,17 +795,59 @@ def main():
     #     AddGaussianNoise(mean=0.0, std=NOISE_STD)
     # ])
     # dataset = ComplexContrastDataset(root_dir=DATA_DIR, transform=transform)
-    mri_transform = transforms.Compose([
+    
+    num_workers = 8
+    
+    
+    item_transform = transforms.Compose([
+        transforms.RandomRotation(degrees=20),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=10),
+        transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5]),
-        # transforms.Resize((256, 256)),
-        # transforms.CenterCrop(78),
     ])
-    num_workers = 0 if device.type == 'mps' else 2
-    # mri_dataset = BidsMriDataset(root_dir=BIDS_ROOT_PATH, transform=mri_transform)
-    mri_dataset = PreprocessedMriDataset(image_dir=PROCESSED_DATA_DIR, transform=mri_transform)
-            
-    train_loader = DataLoader(mri_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers)
+    
+    def custom_collate_fn(batch):
+        """
+        A custom collate_fn that resizes all images in a batch to the same
+        randomly chosen size, and then normalizes them.
+        """
+        # Choose a single random size for the entire batch.
+        # We select a size that is a multiple of 32 for GPU efficiency.
+        possible_sizes = list(range(128, 448, 32))
+        target_size_1 = random.choice(possible_sizes)
+        target_size_2 = random.choice(possible_sizes)
+        # Define the transforms to be applied to the whole batch.
+        # We use antialias=True for better image quality after resizing.
+        batch_transforms = transforms.Compose([
+            transforms.Resize((target_size_1, target_size_2), antialias=True),
+            transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
+        
+        # Apply the batch-level transforms and stack the images into a single tensor.
+        processed_batch = torch.stack([batch_transforms(img) for img in batch])
+        
+        return processed_batch
+
+    
+    mri_dataset = PreprocessedMriDataset(image_dir=PROCESSED_DATA_DIR, transform=item_transform)
+           
+    train_sampler = DistributedSampler(mri_dataset) 
+    
+    print(f"[Rank {rank}] Dataset created. Creating DataLoader...")
+    dist.barrier()
+    
+    
+    train_loader = DataLoader(
+        mri_dataset, 
+        batch_size=BATCH_SIZE, 
+        # shuffle=True, 
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        sampler=train_sampler
+        )
+    
+    print(f"[Rank {rank}] DataLoader created. Starting training loop...")
+    dist.barrier()
             
     # train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=True)
     print(f"Loaded {len(mri_dataset)} image pairs for training.")
@@ -822,6 +895,7 @@ def main():
                 
     print("Starting synthesizer prototype 2 training...")
     for epoch in range(NUM_EPOCHS):
+        train_loader.sampler.set_epoch(epoch)
         for batch_idx, input_images in tqdm.tqdm(enumerate(train_loader), total=len_dataset):
             t0 = time.time()
             input_images = input_images.to(device)
@@ -960,7 +1034,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             optimizer.step()
         
-            if batch_idx == 0 :
+            if rank == 0 and batch_idx == 0 :
                 with torch.no_grad():
                     # num_bins_for_log = NUMBER_OF_BINS
                     # input_hist_data = get_histogram_data(input_images[0], num_bins=num_bins_for_log)
@@ -1043,14 +1117,18 @@ def main():
             
         scheduler.step()
         
-        if (epoch + 1) % 20 == 0 or (epoch + 1) == NUM_EPOCHS or epoch==0:
-            torch.save(generator.state_dict(), MODEL_SAVE_PATH)
+        if rank == 0 and ((epoch + 1) % 20 == 0 or (epoch + 1) == NUM_EPOCHS or epoch==0):
+            torch.save(generator.module.state_dict(), MODEL_SAVE_PATH)
             print(f"Epoch {epoch + 1}: Model saved to {MODEL_SAVE_PATH}")
         
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Total Loss: {total_loss.item():.4f}")
+        if rank == 0:
+            print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Total Loss: {total_loss.item():.4f}")
 
-    print("Training complete.")
-    wandb.finish()
+    if rank == 0:
+        print("Training complete.")
+        wandb.finish()
+    
+    cleanup_ddp()
 
 if __name__ == '__main__':
     main()
